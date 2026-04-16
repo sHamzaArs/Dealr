@@ -10,3 +10,24 @@ import sys
 from scraper import scrape_autotrader, scrape_kijiji, deduplicate
 from scorer import score_all
 
+GREEN  = "\033[92m"
+YELLOW = "\033[93m"
+RED    = "\033[91m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+RESET  = "\033[0m"
+ 
+ 
+ACTION_COLOURS = {
+    "strong buy":           GREEN,
+    "worth investigating":  CYAN,
+    "proceed with caution": YELLOW,
+    "avoid":                RED,
+}
+ 
+ACTION_ICONS = {
+    "strong buy":           "★",
+    "worth investigating":  "◆",
+    "proceed with caution": "▲",
+    "avoid":                "✗",
+}
