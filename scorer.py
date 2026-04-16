@@ -113,21 +113,3 @@ def score_listing(title: str, price: str, url: str, description: str) -> ScoredL
         summary=data["summary"],
         recommended_action=data["recommended_action"]
   )
-
-def score_all(listings: list[dict]) -> list[ScoredListing]:
-    """Score a list of listings and return them sorted best-first."""
-    scored = []
-    for i, l in enumerate(listings):
-        print(f"  Scoring listing {i+1}/{len(listings)}: {l['title'][:50]}...")
-        try:
-            result = score_listing(
-                title=l["title"],
-                price=l["price"],
-                url=l.get("url", "N/A"),
-                description=l["description"]
-            )
-            scored.append(result)
-        except Exception as e:
-            print(f"  ⚠ Failed to score listing: {e}")
- 
-    return sorted(scored, key=lambda x: x.overall_score, reverse=True)
