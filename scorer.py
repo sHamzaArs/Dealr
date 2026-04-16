@@ -98,4 +98,36 @@ def score_listing(title: str, price: str, url: str, description: str) -> ScoredL
       raw = raw[4:]
 
   data = json.loads(raw)
-  
+
+  return ScoredListings(
+    title=title,
+    price=price,
+    url=url,
+    price_score=data["price_score"],
+    mileage_score=data["mileage_score"],
+    listing_quality_score=data["listing_quality_score"],
+    overall_score=data["overall_score"],
+            green_flags=data["green_flags"],
+        red_flags=data["red_flags"],
+        missing_info=data["missing_info"],
+        summary=data["summary"],
+        recommended_action=data["recommended_action"]
+  )
+
+def score_all(listings: list[dict]) -> list[ScoredListing]:
+    """Score a list of listings and return them sorted best-first."""
+    scored = []
+    for i, l in enumerate(listings):
+        print(f"  Scoring listing {i+1}/{len(listings)}: {l['title'][:50]}...")
+        try:
+            result = score_listing(
+                title=l["title"],
+                price=l["price"],
+                url=l.get("url", "N/A"),
+                description=l["description"]
+            )
+            scored.append(result)
+        except Exception as e:
+            print(f"  ⚠ Failed to score listing: {e}")
+ 
+    return sorted(scored, key=lambda x: x.overall_score, reverse=True)
