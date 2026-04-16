@@ -53,3 +53,49 @@ overall_score: weighted average (price 40%, mileage 35%, quality 25%)
 LISTING TO ANALYZE:
 {listing}
 """
+
+@dataclass
+class ScoredListings:
+  title: str
+  price: str
+  url: str
+  price_score: int
+  mileage_score: int
+  listing_quality_score: int
+  overall_score: int
+  green_flags: list[str]
+  red_flags: list[str]
+  missing_info: list[str]
+  summary: str
+  recommended_action: str
+
+def score_listing(title: str, price: str, url: str, description: str) -> ScoredListings:
+  """Score a single listing using Claude."""
+
+  listing_text = """f
+  Title: {title}
+  Price: {price}
+  URL: {url}
+  Description: {description}
+  """ 
+
+  message = client.messages.create(
+    model = "claude-opus-4-5",
+    max_toxens = 1024,
+    messages = [
+      {
+        "role": "user",
+        "content": SCORING_PROMPT.replace("{listing}", listing_text)
+      }
+    ]
+  )
+
+  raw = message.content[0].text.strip()
+
+  if raw.startswith("```"):
+    raw = raw.split("```")[1]
+    if raw.startswith("json"):
+      raw = raw[4:]
+
+  data = json.loads(raw)
+  
