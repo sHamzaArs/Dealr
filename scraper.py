@@ -14,6 +14,26 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 ]
 
+# Map province/city names to AutoTrader region slugs
+AUTOTRADER_REGIONS = {
+    "ontario":          "reg_on",
+    "british columbia": "reg_bc",
+    "alberta":          "reg_ab",
+    "quebec":           "reg_qc",
+    "manitoba":         "reg_mb",
+    "saskatchewan":     "reg_sk",
+    "nova scotia":      "reg_ns",
+    "new brunswick":    "reg_nb",
+    "toronto":          "reg_on",
+    "vancouver":        "reg_bc",
+    "calgary":          "reg_ab",
+    "edmonton":         "reg_ab",
+    "montreal":         "reg_qc",
+    "ottawa":           "reg_on",
+    "mississauga":      "reg_on",
+    "hamilton":         "reg_on",
+}
+
 
 def _get_headers() -> dict:
     return {
@@ -23,6 +43,10 @@ def _get_headers() -> dict:
         "Accept-Encoding": "gzip, deflate, br",
         "DNT": "1",
         "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
     }
 
 
@@ -41,7 +65,7 @@ def _fetch_html(url: str) -> Optional[str]:
             resp = requests.get(url, headers=_get_headers(), timeout=20)
             return resp.text if resp.status_code == 200 else None
         else:
-            print(f"  HTTP {resp.status_code} on {url[:60]}")
+            print(f"  HTTP {resp.status_code} for {url[:80]}")
             return None
     except requests.RequestException as e:
         print(f"  Request failed: {e}")
@@ -49,75 +73,75 @@ def _fetch_html(url: str) -> Optional[str]:
 
 def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
                        price_max: int, location: str, max_results: int = 20) -> List[dict]:
+    # Build the path-based URL AutoTrader actually uses
+    make_slug = make.lower().replace(" ", "_").replace("-", "_")
+    region    = AUTOTRADER_REGIONS.get(location.lower(), "reg_on")
+
     params = {
-        "make":     make,
-        "model":    model,
+        "priceMax": price_max,
         "yearMin":  year_min,
         "yearMax":  year_max,
-        "priceMax": price_max,
-        "loc":      location,
-        "hprc":     "True",
-        "wcp":      "True",
         "sts":      "Used",
         "rcp":      min(max_results, 20),
         "rcs":      0,
         "srt":      35,
+        "prxl":     "500",  # radius
     }
 
-    url = f"https://www.autotrader.ca/cars/?{urlencode(params)}"
-    print(f"  Fetching: {url[:80]}...")
+    # Add model to params if provided (AutoTrader uses it as a query param)
+    if model:
+        params["mdl"] = model
+
+    url = f"https://www.autotrader.ca/cars/{make_slug}/{region}/ot_used?{urlencode(params)}"
+    print(f"  Fetching: {url}")
 
     html = _fetch_html(url)
     if not html:
         return []
 
+    return _extract_from_next_data(html, "AutoTrader CA", max_results)
+
+
+def _extract_from_next_data(html: str, source_name: str, max_results: int) -> List[dict]:
+    """Extract listings from __NEXT_DATA__ JSON blob."""
     soup = BeautifulSoup(html, "html.parser")
+    tag  = soup.find("script", {"id": "__NEXT_DATA__"})
 
-    # AutoTrader embeds all listing data in a <script id="__NEXT_DATA__"> tag
-    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-    if not next_data_tag:
-        print("  Could not find __NEXT_DATA__ JSON blob in page")
+    if not tag:
+        print(f"  ❌ No __NEXT_DATA__ tag found in page")
+        # Print page title so we know what we got
+        title = soup.find("title")
+        print(f"  Page title: {title.get_text() if title else 'unknown'}")
         return []
 
     try:
-        data = json.loads(next_data_tag.string)
+        data = json.loads(tag.string)
     except (json.JSONDecodeError, TypeError) as e:
-        print(f"  Failed to parse __NEXT_DATA__ JSON: {e}")
+        print(f"  ❌ JSON parse failed: {e}")
         return []
 
-    # Navigate the JSON structure to get listings
-    try:
-        raw_listings = (
-            data["props"]["pageProps"]["listings"]
-        )
-    except (KeyError, TypeError):
-        print("  Could not find listings in JSON structure")
+    page_props = data.get("props", {}).get("pageProps", {})
+    raw_listings = page_props.get("listings", [])
+
+    if not raw_listings:
+        # Debug: show what keys ARE present
+        print(f"  ⚠️  No 'listings' key found. pageProps keys: {list(page_props.keys())[:10]}")
         return []
 
-    print(f"  Found {len(raw_listings)} listings in JSON")
+    print(f"  ✅ Found {len(raw_listings)} listings in JSON")
 
     listings = []
     for item in raw_listings[:max_results]:
-        listing = _parse_autotrader_json_listing(item)
+        listing = _parse_autotrader_listing(item, source_name)
         if listing:
             listings.append(listing)
 
-    # Fetch detail pages for full descriptions
-    if listings:
-        print(f"  Fetching descriptions for {len(listings)} listings...")
-        for i, listing in enumerate(listings):
-            if listing.get("url") and listing["url"] != "N/A":
-                _polite_delay()
-                desc = _fetch_autotrader_description(listing["url"])
-                if desc:
-                    listing["description"] = desc
-            if i > 0 and i % 5 == 0:
-                print(f"    {i}/{len(listings)} done...")
-
+    # Descriptions are already in the JSON — skip fetching detail pages to save time
+    # (The JSON already includes full descriptions as seen in autotrader_debug.html)
     return listings
 
 
-def _parse_autotrader_json_listing(item: dict) -> Optional[dict]:
+def _parse_autotrader_listing(item: dict, source: str) -> Optional[dict]:
     try:
         vehicle  = item.get("vehicle", {})
         price    = item.get("price", {})
@@ -127,7 +151,7 @@ def _parse_autotrader_json_listing(item: dict) -> Optional[dict]:
         year  = vehicle.get("modelYear", "")
         make  = vehicle.get("make", "")
         model = vehicle.get("model", "")
-        trim  = vehicle.get("modelVersionInput", "") or ""
+        trim  = vehicle.get("modelVersionInput") or ""
         km    = vehicle.get("mileageInKm", "N/A")
         fuel  = vehicle.get("fuel", "")
 
@@ -135,32 +159,27 @@ def _parse_autotrader_json_listing(item: dict) -> Optional[dict]:
         if trim:
             title += f" {trim}"
 
-        price_str = price.get("priceFormatted", "N/A")
-        url = item.get("url", "N/A")
-        city = location.get("city", "")
-        province = location.get("provinceCode", "")
+        price_str   = price.get("priceFormatted", "N/A")
+        url         = item.get("url", "N/A")
+        city        = location.get("city", "")
+        province    = location.get("provinceCode", "")
         seller_name = seller.get("companyName", "")
 
-        # Use description from JSON if available, otherwise build from fields
+        # Description is embedded in the JSON (confirmed in debug HTML)
         description = item.get("description", "")
         if description:
-            # Strip HTML tags from description
-            desc_soup = BeautifulSoup(description, "html.parser")
+            desc_soup   = BeautifulSoup(description, "html.parser")
             description = desc_soup.get_text(separator=" ", strip=True)[:2000]
         else:
             parts = []
-            if km:
-                parts.append(f"Mileage: {km}")
-            if fuel:
-                parts.append(f"Fuel: {fuel}")
-            if city:
-                parts.append(f"Location: {city}, {province}")
-            if seller_name:
-                parts.append(f"Seller: {seller_name}")
+            if fuel:        parts.append(f"Fuel: {fuel}")
+            if km:          parts.append(f"Mileage: {km}")
+            if city:        parts.append(f"Location: {city}, {province}")
+            if seller_name: parts.append(f"Seller: {seller_name}")
             description = ". ".join(parts)
 
         return {
-            "source":      "AutoTrader CA",
+            "source":      source,
             "title":       title,
             "price":       price_str,
             "mileage":     str(km),
@@ -169,36 +188,6 @@ def _parse_autotrader_json_listing(item: dict) -> Optional[dict]:
         }
     except Exception as e:
         return None
-
-
-def _fetch_autotrader_description(url: str) -> Optional[str]:
-    html = _fetch_html(url)
-    if not html:
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-
-    if next_data_tag:
-        try:
-            data = json.loads(next_data_tag.string)
-            # Try to find description in detail page JSON
-            props = data.get("props", {}).get("pageProps", {})
-            listing = props.get("listing", props.get("vehicle", {}))
-            desc = listing.get("description", "")
-            if desc:
-                desc_soup = BeautifulSoup(desc, "html.parser")
-                return desc_soup.get_text(separator=" ", strip=True)[:2000]
-        except Exception:
-            pass
-
-    # Fallback: parse HTML description elements
-    for selector in ["div.vdp-description", "[class*='description']", "[class*='Details']"]:
-        el = soup.select_one(selector)
-        if el:
-            return el.get_text(separator=" ", strip=True)[:2000]
-
-    return None
 
 KIJIJI_LOCATION_CODES = {
     "ontario":          "l1700272",
@@ -231,87 +220,77 @@ def scrape_kijiji(make: str, model: str, year_min: int, year_max: int,
     url = (f"https://www.kijiji.ca/b-cars-trucks/{loc_code}/"
            f"{query}/k0c174?{urlencode(params)}")
 
-    print(f"  Fetching: {url[:80]}...")
+    print(f"  Fetching: {url}")
 
     html = _fetch_html(url)
     if not html:
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Try __NEXT_DATA__ first (Kijiji is also Next.js)
-    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+    soup     = BeautifulSoup(html, "html.parser")
     listings = []
 
-    if next_data_tag:
+    # Try __NEXT_DATA__ JSON first
+    tag = soup.find("script", {"id": "__NEXT_DATA__"})
+    if tag:
         try:
-            data = json.loads(next_data_tag.string)
-            raw_listings = _extract_kijiji_listings_from_json(data)
+            data         = json.loads(tag.string)
+            page_props   = data.get("props", {}).get("pageProps", {})
+            raw_listings = _find_kijiji_listings(page_props)
+
             if raw_listings:
-                print(f"  Found {len(raw_listings)} listings in JSON")
+                print(f"  ✅ Found {len(raw_listings)} listings in JSON")
                 for item in raw_listings[:max_results]:
-                    listing = _parse_kijiji_json_listing(item)
+                    listing = _parse_kijiji_listing(item)
                     if listing:
                         listings.append(listing)
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # Fallback: try HTML card parsing if JSON extraction failed
+    # Fallback: HTML card parsing
     if not listings:
-        print("  JSON extraction failed, trying HTML cards...")
+        print("  ⚠️  JSON failed, trying HTML cards...")
         listings = _scrape_kijiji_html(soup, max_results)
-
-    # Fetch detail pages for full descriptions
-    if listings:
-        print(f"  Fetching descriptions for {len(listings)} Kijiji listings...")
-        for i, listing in enumerate(listings):
-            if listing.get("url") and listing["url"] != "N/A":
-                _polite_delay()
-                desc = _fetch_kijiji_description(listing["url"])
-                if desc:
-                    listing["description"] = desc
-            if i > 0 and i % 5 == 0:
-                print(f"    {i}/{len(listings)} done...")
 
     return listings
 
 
-def _extract_kijiji_listings_from_json(data: dict) -> List[dict]:
+def _find_kijiji_listings(page_props: dict) -> List[dict]:
+    # Direct key
+    for key in ("listings", "ads", "searchResults"):
+        val = page_props.get(key)
+        if isinstance(val, list) and val:
+            return val
+
+    # One level deep
+    for key in ("initialProps", "initialData", "searchData", "srp", "listingData"):
+        section = page_props.get(key)
+        if isinstance(section, dict):
+            for sub in ("listings", "ads", "searchResults"):
+                val = section.get(sub)
+                if isinstance(val, list) and val:
+                    return val
+
+    return []
+
+
+def _parse_kijiji_listing(item: dict) -> Optional[dict]:
     try:
-        # Kijiji structure varies — try common paths
-        page_props = data.get("props", {}).get("pageProps", {})
+        title    = item.get("title", item.get("headline", ""))
+        price    = item.get("price", {})
+        url_path = item.get("seoUrl", item.get("url", ""))
+        desc     = item.get("description", "")
+        attrs    = item.get("attributes", {})
 
-        # Try path 1: listings directly
-        items = page_props.get("listings", page_props.get("ads", []))
-        if items:
-            return items
+        if not title or len(title) < 3:
+            return None
 
-        # Try path 2: nested under initialProps or similar
-        for key in ["initialProps", "initialData", "searchData", "srp"]:
-            section = page_props.get(key, {})
-            if isinstance(section, dict):
-                items = section.get("listings", section.get("ads", []))
-                if items:
-                    return items
+        if isinstance(price, dict):
+            price_str = price.get("amount", price.get("displayPrice", "N/A"))
+        else:
+            price_str = str(price) if price else "N/A"
 
-        return []
-    except Exception:
-        return []
-
-
-def _parse_kijiji_json_listing(item: dict) -> Optional[dict]:
-    try:
-        title     = item.get("title", item.get("headline", "Unknown"))
-        price     = item.get("price", {})
-        url_path  = item.get("seoUrl", item.get("url", ""))
-        desc      = item.get("description", "")
-        attrs     = item.get("attributes", {})
-
-        price_str = price.get("amount", "N/A") if isinstance(price, dict) else str(price)
-        if isinstance(price_str, (int, float)):
-            price_str = f"${price_str:,.0f}"
-
-        url = f"https://www.kijiji.ca{url_path}" if url_path.startswith("/") else url_path or "N/A"
+        url = (f"https://www.kijiji.ca{url_path}"
+               if url_path.startswith("/") else url_path or "N/A")
 
         km = "N/A"
         if isinstance(attrs, dict):
@@ -323,13 +302,9 @@ def _parse_kijiji_json_listing(item: dict) -> Optional[dict]:
                     break
 
         if desc:
-            desc_soup = BeautifulSoup(desc, "html.parser")
-            desc = desc_soup.get_text(separator=" ", strip=True)[:2000]
+            desc = BeautifulSoup(desc, "html.parser").get_text(separator=" ", strip=True)[:2000]
         else:
             desc = f"Mileage: {km}"
-
-        if not title or len(title) < 3:
-            return None
 
         return {
             "source":      "Kijiji",
@@ -346,16 +321,20 @@ def _parse_kijiji_json_listing(item: dict) -> Optional[dict]:
 def _scrape_kijiji_html(soup: BeautifulSoup, max_results: int) -> List[dict]:
     cards = (soup.select("li[data-listing-id]") or
              soup.select("[data-testid='listing-card']") or
-             soup.select("article[class*='listing']"))
+             soup.select("article[class*='listing']") or
+             soup.select("div[class*='regular-ad']"))
 
     print(f"  Found {len(cards)} HTML cards")
     listings = []
 
     for card in cards[:max_results]:
         try:
-            title_el = card.select_one("[class*='title']") or card.select_one("h3")
+            title_el = (card.select_one("[class*='title']") or
+                        card.select_one("h3") or
+                        card.select_one("a[data-listing-id]"))
             price_el = card.select_one("[class*='price']")
-            link_el  = card.select_one("a[href*='/v-']") or card.select_one("a")
+            link_el  = (card.select_one("a[href*='/v-']") or
+                        card.select_one("a[href*='/a-']"))
             km_el    = card.select_one("[class*='mileage']") or card.select_one("[class*='km']")
 
             title = title_el.get_text(strip=True) if title_el else None
@@ -379,37 +358,6 @@ def _scrape_kijiji_html(soup: BeautifulSoup, max_results: int) -> List[dict]:
             continue
 
     return listings
-
-
-def _fetch_kijiji_description(url: str) -> Optional[str]:
-    html = _fetch_html(url)
-    if not html:
-        return None
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Try __NEXT_DATA__ first
-    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
-    if next_data_tag:
-        try:
-            data = json.loads(next_data_tag.string)
-            props = data.get("props", {}).get("pageProps", {})
-            for key in ["ad", "listing", "vip"]:
-                item = props.get(key, {})
-                if isinstance(item, dict):
-                    desc = item.get("description", "")
-                    if desc:
-                        return BeautifulSoup(desc, "html.parser").get_text(separator=" ", strip=True)[:2000]
-        except Exception:
-            pass
-
-    # Fallback HTML
-    for selector in ["[class*='description']", "[itemprop='description']", "[data-testid='vip-description']"]:
-        el = soup.select_one(selector)
-        if el:
-            return el.get_text(separator=" ", strip=True)[:2000]
-
-    return None
 
 def deduplicate(listings: List[dict]) -> List[dict]:
     seen   = set()
