@@ -3,7 +3,7 @@ import random
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlencode
-from typing import Optional
+from typing import Optional, List
 
 # Rotating user agents — mimics real browsers so we don't get blocked immediately
 USER_AGENTS = [
@@ -48,7 +48,7 @@ def _fetch(url: str) -> Optional[BeautifulSoup]:
     return None
 
 def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
-                       price_max: int, location: str, max_results: int = 20) -> list[dict]:
+                       price_max: int, location: str, max_results: int = 20) -> List[dict]:
 
     params = {
         "make": make,
@@ -203,7 +203,7 @@ KIJIJI_LOCATION_CODES = {
 
 
 def scrape_kijiji(make: str, model: str, year_min: int, year_max: int,
-                   price_max: int, location: str, max_results: int = 20) -> list[dict]:
+                   price_max: int, location: str, max_results: int = 20) -> List[dict]:
 
     loc_code = KIJIJI_LOCATION_CODES.get(location.lower(), "l1700272")
     query = f"{make} {model}".strip()
@@ -287,7 +287,7 @@ def _fetch_kijiji_detail(url: str) -> Optional[str]:
 
     return None
 
-def deduplicate(listings: list[dict]) -> list[dict]:
+def deduplicate(listings: List[dict]) -> List[dict]:
     seen = set()
     unique = []
     for listing in listings:

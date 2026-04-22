@@ -1,12 +1,8 @@
-"""
-scorer.py — AI-powered used car listing scorer
-Calls Claude to extract signals from a listing and returns a structured score.
-"""
-
 import os
 import json
 import anthropic
 from dataclasses import dataclass
+from typing import List
 
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
@@ -69,15 +65,14 @@ class ScoredListing:
     mileage_score: int
     listing_quality_score: int
     overall_score: int
-    green_flags: list[str]
-    red_flags: list[str]
-    missing_info: list[str]
+    green_flags: List[str]
+    red_flags: List[str]
+    missing_info: List[str]
     summary: str
     recommended_action: str
 
 
 def score_listing(title: str, price: str, url: str, description: str) -> ScoredListing:
-    """Score a single listing using Claude."""
 
     listing_text = f"""
 Title: {title}
@@ -124,8 +119,7 @@ Description:
     )
 
 
-def score_all(listings: list[dict]) -> list[ScoredListing]:
-    """Score a list of listings and return them sorted best-first."""
+def score_all(listings: List[dict]) -> List[ScoredListing]:
     scored = []
     for i, l in enumerate(listings):
         print(f"  Scoring listing {i+1}/{len(listings)}: {l['title'][:50]}...")
