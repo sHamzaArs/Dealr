@@ -1,36 +1,54 @@
+import json
 import time
 import random
-from typing import Optional, List
-from urllib.parse import urlencode
+import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
+from urllib.parse import urlencode
+from typing import Optional, List
+
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+]
+
+
+def _get_headers() -> dict:
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-CA,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+    }
 
 
 def _polite_delay():
     time.sleep(random.uniform(2, 4))
 
 
-def _get_soup(page: Page, url: str, wait_selector: str = None) -> Optional[BeautifulSoup]:
+def _fetch_html(url: str) -> Optional[str]:
     try:
-        page.goto(url, timeout=30000, wait_until="domcontentloaded")
-
-        if wait_selector:
-            try:
-                page.wait_for_selector(wait_selector, timeout=10000)
-            except PlaywrightTimeout:
-                pass  # Parse whatever loaded
-
-        # Extra wait for JS to render
-        page.wait_for_timeout(2000)
-        return BeautifulSoup(page.content(), "html.parser")
-
-    except Exception as e:
-        print(f"  Failed to load {url[:60]}: {e}")
+        resp = requests.get(url, headers=_get_headers(), timeout=20)
+        if resp.status_code == 200:
+            return resp.text
+        elif resp.status_code == 429:
+            print(f"  Rate limited — waiting 30s...")
+            time.sleep(30)
+            resp = requests.get(url, headers=_get_headers(), timeout=20)
+            return resp.text if resp.status_code == 200 else None
+        else:
+            print(f"  HTTP {resp.status_code} on {url[:60]}")
+            return None
+    except requests.RequestException as e:
+        print(f"  Request failed: {e}")
         return None
 
 def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
                        price_max: int, location: str, max_results: int = 20) -> List[dict]:
-
     params = {
         "make":     make,
         "model":    model,
@@ -41,151 +59,144 @@ def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
         "hprc":     "True",
         "wcp":      "True",
         "sts":      "Used",
-        "rcp":      min(max_results, 15),
+        "rcp":      min(max_results, 20),
         "rcs":      0,
         "srt":      35,
     }
 
-    search_url = f"https://www.autotrader.ca/cars/?{urlencode(params)}"
-    print(f"  Fetching: {search_url[:80]}...")
+    url = f"https://www.autotrader.ca/cars/?{urlencode(params)}"
+    print(f"  Fetching: {url[:80]}...")
+
+    html = _fetch_html(url)
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # AutoTrader embeds all listing data in a <script id="__NEXT_DATA__"> tag
+    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+    if not next_data_tag:
+        print("  Could not find __NEXT_DATA__ JSON blob in page")
+        return []
+
+    try:
+        data = json.loads(next_data_tag.string)
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"  Failed to parse __NEXT_DATA__ JSON: {e}")
+        return []
+
+    # Navigate the JSON structure to get listings
+    try:
+        raw_listings = (
+            data["props"]["pageProps"]["listings"]
+        )
+    except (KeyError, TypeError):
+        print("  Could not find listings in JSON structure")
+        return []
+
+    print(f"  Found {len(raw_listings)} listings in JSON")
 
     listings = []
+    for item in raw_listings[:max_results]:
+        listing = _parse_autotrader_json_listing(item)
+        if listing:
+            listings.append(listing)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="en-CA",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.new_page()
-
-        # Block images/fonts to speed up loading
-        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
-
-        soup = _get_soup(page, search_url, wait_selector="[class*='result-item'], [data-listing-id]")
-
-        if not soup:
-            browser.close()
-            return []
-
-        # Try standard card selectors
-        cards = (soup.select("div[data-listing-id]") or
-                 soup.select("div[class*='result-item']") or
-                 soup.select("div[class*='listing-card']"))
-
-        if cards:
-            print(f"  Found {len(cards)} listing cards")
-            for card in cards[:max_results]:
-                listing = _parse_autotrader_card(card)
-                if listing:
-                    listings.append(listing)
-        else:
-            # Fallback: scrape listing URLs from links and visit each one
-            print("  No cards found via selectors — trying link extraction...")
-            links = soup.select("a[href*='/a/used/']") or soup.select("a[href*='autotrader.ca/a/']")
-            urls  = list(dict.fromkeys(  # deduplicate while preserving order
-                "https://www.autotrader.ca" + a["href"] if a["href"].startswith("/") else a["href"]
-                for a in links if a.get("href")
-            ))[:max_results]
-            print(f"  Found {len(urls)} listing links")
-
-            for url in urls:
+    # Fetch detail pages for full descriptions
+    if listings:
+        print(f"  Fetching descriptions for {len(listings)} listings...")
+        for i, listing in enumerate(listings):
+            if listing.get("url") and listing["url"] != "N/A":
                 _polite_delay()
-                detail_soup = _get_soup(page, url)
-                if detail_soup:
-                    listing = _parse_autotrader_detail_page(detail_soup, url)
-                    if listing:
-                        listings.append(listing)
-
-        # Fetch detail pages for full descriptions if we got cards
-        if listings and cards:
-            print(f"  Fetching details for {len(listings)} listings...")
-            for i, listing in enumerate(listings):
-                if listing.get("url") and listing["url"] != "N/A":
-                    _polite_delay()
-                    detail_soup = _get_soup(page, listing["url"])
-                    if detail_soup:
-                        desc = _extract_autotrader_description(detail_soup)
-                        if desc:
-                            listing["description"] = desc
-                if i % 5 == 0 and i > 0:
-                    print(f"    {i}/{len(listings)} details fetched...")
-
-        browser.close()
+                desc = _fetch_autotrader_description(listing["url"])
+                if desc:
+                    listing["description"] = desc
+            if i > 0 and i % 5 == 0:
+                print(f"    {i}/{len(listings)} done...")
 
     return listings
 
 
-def _parse_autotrader_card(card) -> Optional[dict]:
+def _parse_autotrader_json_listing(item: dict) -> Optional[dict]:
     try:
-        title_el = (card.select_one("span.title-with-trim") or
-                    card.select_one("[class*='title']"))
-        price_el = (card.select_one("span.price-amount") or
-                    card.select_one("[class*='price']"))
-        link_el  = card.select_one("a[href*='/a/']") or card.select_one("a")
-        km_el    = (card.select_one("[class*='kms']") or
-                    card.select_one("[class*='mileage']") or
-                    card.select_one("[class*='odometer']"))
+        vehicle  = item.get("vehicle", {})
+        price    = item.get("price", {})
+        location = item.get("location", {})
+        seller   = item.get("seller", {})
 
-        title = title_el.get_text(strip=True) if title_el else None
-        price = price_el.get_text(strip=True) if price_el else "N/A"
-        href  = link_el.get("href", "") if link_el else ""
-        url   = ("https://www.autotrader.ca" + href) if href.startswith("/") else href or "N/A"
-        km    = km_el.get_text(strip=True) if km_el else "N/A"
+        year  = vehicle.get("modelYear", "")
+        make  = vehicle.get("make", "")
+        model = vehicle.get("model", "")
+        trim  = vehicle.get("modelVersionInput", "") or ""
+        km    = vehicle.get("mileageInKm", "N/A")
+        fuel  = vehicle.get("fuel", "")
 
-        if not title:
-            return None
+        title = f"{year} {make} {model}".strip()
+        if trim:
+            title += f" {trim}"
+
+        price_str = price.get("priceFormatted", "N/A")
+        url = item.get("url", "N/A")
+        city = location.get("city", "")
+        province = location.get("provinceCode", "")
+        seller_name = seller.get("companyName", "")
+
+        # Use description from JSON if available, otherwise build from fields
+        description = item.get("description", "")
+        if description:
+            # Strip HTML tags from description
+            desc_soup = BeautifulSoup(description, "html.parser")
+            description = desc_soup.get_text(separator=" ", strip=True)[:2000]
+        else:
+            parts = []
+            if km:
+                parts.append(f"Mileage: {km}")
+            if fuel:
+                parts.append(f"Fuel: {fuel}")
+            if city:
+                parts.append(f"Location: {city}, {province}")
+            if seller_name:
+                parts.append(f"Seller: {seller_name}")
+            description = ". ".join(parts)
 
         return {
             "source":      "AutoTrader CA",
             "title":       title,
-            "price":       price,
-            "mileage":     km,
+            "price":       price_str,
+            "mileage":     str(km),
             "url":         url,
-            "description": f"Mileage: {km}",
+            "description": description,
         }
-    except Exception:
+    except Exception as e:
         return None
 
 
-def _parse_autotrader_detail_page(soup: BeautifulSoup, url: str) -> Optional[dict]:
-    try:
-        title_el = (soup.select_one("h1[class*='title']") or
-                    soup.select_one("h1"))
-        price_el = (soup.select_one("[class*='price-amount']") or
-                    soup.select_one("[class*='listing-price']"))
-        km_el    = (soup.select_one("[class*='kms']") or
-                    soup.select_one("[class*='mileage']"))
-
-        title = title_el.get_text(strip=True) if title_el else "Unknown listing"
-        price = price_el.get_text(strip=True) if price_el else "N/A"
-        km    = km_el.get_text(strip=True) if km_el else "N/A"
-        desc  = _extract_autotrader_description(soup) or f"Mileage: {km}"
-
-        return {
-            "source":      "AutoTrader CA",
-            "title":       title,
-            "price":       price,
-            "mileage":     km,
-            "url":         url,
-            "description": desc,
-        }
-    except Exception:
+def _fetch_autotrader_description(url: str) -> Optional[str]:
+    html = _fetch_html(url)
+    if not html:
         return None
 
+    soup = BeautifulSoup(html, "html.parser")
+    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
 
-def _extract_autotrader_description(soup: BeautifulSoup) -> Optional[str]:
-    desc_el = (soup.select_one("div.vdp-description") or
-               soup.select_one("[class*='description']") or
-               soup.select_one("section[class*='details']"))
+    if next_data_tag:
+        try:
+            data = json.loads(next_data_tag.string)
+            # Try to find description in detail page JSON
+            props = data.get("props", {}).get("pageProps", {})
+            listing = props.get("listing", props.get("vehicle", {}))
+            desc = listing.get("description", "")
+            if desc:
+                desc_soup = BeautifulSoup(desc, "html.parser")
+                return desc_soup.get_text(separator=" ", strip=True)[:2000]
+        except Exception:
+            pass
 
-    if desc_el:
-        return desc_el.get_text(separator=" ", strip=True)[:2000]
-
-    specs = soup.select("dt, dd")
-    if specs:
-        return " | ".join(s.get_text(strip=True) for s in specs)[:2000]
+    # Fallback: parse HTML description elements
+    for selector in ["div.vdp-description", "[class*='description']", "[class*='Details']"]:
+        el = soup.select_one(selector)
+        if el:
+            return el.get_text(separator=" ", strip=True)[:2000]
 
     return None
 
@@ -210,7 +221,6 @@ KIJIJI_LOCATION_CODES = {
 
 def scrape_kijiji(make: str, model: str, year_min: int, year_max: int,
                    price_max: int, location: str, max_results: int = 20) -> List[dict]:
-
     loc_code = KIJIJI_LOCATION_CODES.get(location.lower(), "l1700272")
     query    = f"{make} {model}".strip().lower().replace(" ", "-")
     params   = {
@@ -218,75 +228,105 @@ def scrape_kijiji(make: str, model: str, year_min: int, year_max: int,
         "year":  f"{year_min}__{year_max}",
     }
 
-    search_url = (f"https://www.kijiji.ca/b-cars-trucks/{loc_code}/"
-                  f"{query}/k0c174?{urlencode(params)}")
+    url = (f"https://www.kijiji.ca/b-cars-trucks/{loc_code}/"
+           f"{query}/k0c174?{urlencode(params)}")
 
-    print(f"  Fetching: {search_url[:80]}...")
+    print(f"  Fetching: {url[:80]}...")
 
+    html = _fetch_html(url)
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Try __NEXT_DATA__ first (Kijiji is also Next.js)
+    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
     listings = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            locale="en-CA",
-            viewport={"width": 1280, "height": 800},
-        )
-        page = context.new_page()
-        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
+    if next_data_tag:
+        try:
+            data = json.loads(next_data_tag.string)
+            raw_listings = _extract_kijiji_listings_from_json(data)
+            if raw_listings:
+                print(f"  Found {len(raw_listings)} listings in JSON")
+                for item in raw_listings[:max_results]:
+                    listing = _parse_kijiji_json_listing(item)
+                    if listing:
+                        listings.append(listing)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-        soup = _get_soup(page, search_url, wait_selector="[data-listing-id], article")
+    # Fallback: try HTML card parsing if JSON extraction failed
+    if not listings:
+        print("  JSON extraction failed, trying HTML cards...")
+        listings = _scrape_kijiji_html(soup, max_results)
 
-        if not soup:
-            browser.close()
-            return []
-
-        cards = (soup.select("li[data-listing-id]") or
-                 soup.select("article[class*='listing']") or
-                 soup.select("div[class*='regular-ad']") or
-                 soup.select("[data-testid='listing-card']"))
-
-        print(f"  Found {len(cards)} cards on Kijiji")
-
-        for card in cards[:max_results]:
-            listing = _parse_kijiji_card(card)
-            if listing:
-                listings.append(listing)
-
-        # Fetch detail pages
-        if listings:
-            print(f"  Fetching details for {len(listings)} Kijiji listings...")
-            for i, listing in enumerate(listings):
-                if listing.get("url") and listing["url"] != "N/A":
-                    _polite_delay()
-                    detail_soup = _get_soup(page, listing["url"])
-                    if detail_soup:
-                        desc = _extract_kijiji_description(detail_soup)
-                        if desc:
-                            listing["description"] = desc
-                if i % 5 == 0 and i > 0:
-                    print(f"    {i}/{len(listings)} details fetched...")
-
-        browser.close()
+    # Fetch detail pages for full descriptions
+    if listings:
+        print(f"  Fetching descriptions for {len(listings)} Kijiji listings...")
+        for i, listing in enumerate(listings):
+            if listing.get("url") and listing["url"] != "N/A":
+                _polite_delay()
+                desc = _fetch_kijiji_description(listing["url"])
+                if desc:
+                    listing["description"] = desc
+            if i > 0 and i % 5 == 0:
+                print(f"    {i}/{len(listings)} done...")
 
     return listings
 
 
-def _parse_kijiji_card(card) -> Optional[dict]:
+def _extract_kijiji_listings_from_json(data: dict) -> List[dict]:
     try:
-        title_el = (card.select_one("[class*='title']") or
-                    card.select_one("h3") or
-                    card.select_one("a"))
-        price_el = card.select_one("[class*='price']")
-        link_el  = card.select_one("a[href*='/v-']") or card.select_one("a")
-        km_el    = (card.select_one("[class*='mileage']") or
-                    card.select_one("[class*='km']"))
+        # Kijiji structure varies — try common paths
+        page_props = data.get("props", {}).get("pageProps", {})
 
-        title = title_el.get_text(strip=True) if title_el else None
-        price = price_el.get_text(strip=True) if price_el else "N/A"
-        href  = link_el.get("href", "") if link_el else ""
-        url   = f"https://www.kijiji.ca{href}" if href.startswith("/") else href or "N/A"
-        km    = km_el.get_text(strip=True) if km_el else "N/A"
+        # Try path 1: listings directly
+        items = page_props.get("listings", page_props.get("ads", []))
+        if items:
+            return items
+
+        # Try path 2: nested under initialProps or similar
+        for key in ["initialProps", "initialData", "searchData", "srp"]:
+            section = page_props.get(key, {})
+            if isinstance(section, dict):
+                items = section.get("listings", section.get("ads", []))
+                if items:
+                    return items
+
+        return []
+    except Exception:
+        return []
+
+
+def _parse_kijiji_json_listing(item: dict) -> Optional[dict]:
+    try:
+        title     = item.get("title", item.get("headline", "Unknown"))
+        price     = item.get("price", {})
+        url_path  = item.get("seoUrl", item.get("url", ""))
+        desc      = item.get("description", "")
+        attrs     = item.get("attributes", {})
+
+        price_str = price.get("amount", "N/A") if isinstance(price, dict) else str(price)
+        if isinstance(price_str, (int, float)):
+            price_str = f"${price_str:,.0f}"
+
+        url = f"https://www.kijiji.ca{url_path}" if url_path.startswith("/") else url_path or "N/A"
+
+        km = "N/A"
+        if isinstance(attrs, dict):
+            km = attrs.get("kilometres", attrs.get("mileage", "N/A"))
+        elif isinstance(attrs, list):
+            for attr in attrs:
+                if isinstance(attr, dict) and attr.get("name", "").lower() in ("kilometres", "mileage"):
+                    km = attr.get("value", "N/A")
+                    break
+
+        if desc:
+            desc_soup = BeautifulSoup(desc, "html.parser")
+            desc = desc_soup.get_text(separator=" ", strip=True)[:2000]
+        else:
+            desc = f"Mileage: {km}"
 
         if not title or len(title) < 3:
             return None
@@ -294,23 +334,80 @@ def _parse_kijiji_card(card) -> Optional[dict]:
         return {
             "source":      "Kijiji",
             "title":       title,
-            "price":       price,
-            "mileage":     km,
+            "price":       str(price_str),
+            "mileage":     str(km),
             "url":         url,
-            "description": f"Mileage: {km}",
+            "description": desc,
         }
     except Exception:
         return None
 
 
-def _extract_kijiji_description(soup: BeautifulSoup) -> Optional[str]:
-    desc_el = (soup.select_one("[class*='description']") or
-               soup.select_one("[itemprop='description']") or
-               soup.select_one("[data-testid='vip-description']") or
-               soup.select_one("div[class*='Details']"))
+def _scrape_kijiji_html(soup: BeautifulSoup, max_results: int) -> List[dict]:
+    cards = (soup.select("li[data-listing-id]") or
+             soup.select("[data-testid='listing-card']") or
+             soup.select("article[class*='listing']"))
 
-    if desc_el:
-        return desc_el.get_text(separator=" ", strip=True)[:2000]
+    print(f"  Found {len(cards)} HTML cards")
+    listings = []
+
+    for card in cards[:max_results]:
+        try:
+            title_el = card.select_one("[class*='title']") or card.select_one("h3")
+            price_el = card.select_one("[class*='price']")
+            link_el  = card.select_one("a[href*='/v-']") or card.select_one("a")
+            km_el    = card.select_one("[class*='mileage']") or card.select_one("[class*='km']")
+
+            title = title_el.get_text(strip=True) if title_el else None
+            if not title or len(title) < 3:
+                continue
+
+            price = price_el.get_text(strip=True) if price_el else "N/A"
+            href  = link_el.get("href", "") if link_el else ""
+            url   = f"https://www.kijiji.ca{href}" if href.startswith("/") else href or "N/A"
+            km    = km_el.get_text(strip=True) if km_el else "N/A"
+
+            listings.append({
+                "source":      "Kijiji",
+                "title":       title,
+                "price":       price,
+                "mileage":     km,
+                "url":         url,
+                "description": f"Mileage: {km}",
+            })
+        except Exception:
+            continue
+
+    return listings
+
+
+def _fetch_kijiji_description(url: str) -> Optional[str]:
+    html = _fetch_html(url)
+    if not html:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Try __NEXT_DATA__ first
+    next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+    if next_data_tag:
+        try:
+            data = json.loads(next_data_tag.string)
+            props = data.get("props", {}).get("pageProps", {})
+            for key in ["ad", "listing", "vip"]:
+                item = props.get(key, {})
+                if isinstance(item, dict):
+                    desc = item.get("description", "")
+                    if desc:
+                        return BeautifulSoup(desc, "html.parser").get_text(separator=" ", strip=True)[:2000]
+        except Exception:
+            pass
+
+    # Fallback HTML
+    for selector in ["[class*='description']", "[itemprop='description']", "[data-testid='vip-description']"]:
+        el = soup.select_one(selector)
+        if el:
+            return el.get_text(separator=" ", strip=True)[:2000]
 
     return None
 
