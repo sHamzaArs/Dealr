@@ -4,13 +4,14 @@ An AI-powered CLI tool that scrapes used car listings from AutoTrader CA and Kij
 
 ## How it works
 
-1. Scrapes listings from AutoTrader CA and/or Kijiji using Apify
-2. Deduplicates cross-platform listings
-3. Scores each listing with Claude AI across three dimensions:
-   - **Price** (40%) — vs. market average for that make/model/year
-   - **Mileage** (35%) — age-adjusted km rating
-   - **Listing quality** (25%) — maintenance history, red flag language, missing info
-4. Ranks and displays results with plain-English verdicts
+1. Scrapes listings directly from AutoTrader CA and/or Kijiji using `requests` and `BeautifulSoup`
+2. Fetches individual listing pages to extract full descriptions
+3. Deduplicates cross-platform listings
+4. Scores each listing with Claude AI across three dimensions:
+   - **Price** (40%) — vs. market average for that make/model/year in Canada
+   - **Mileage** (35%) — age-adjusted km rating (~20,000 km/year is average in Canada)
+   - **Listing quality** (25%) — maintenance history, red flag language, missing info, seller tone
+5. Ranks and displays results with plain-English verdicts
 
 ## Setup
 
@@ -22,26 +23,26 @@ cd car_scorer
 pip install -r requirements.txt
 ```
 
-### 2. Get API keys
+### 2. Get your Anthropic API key
 
-- **Anthropic API key** — [console.anthropic.com](https://console.anthropic.com)
-- **Apify API token** — [apify.com](https://apify.com) (free tier gives $5/month credit)
+Sign up at [console.anthropic.com](https://console.anthropic.com) and create an API key. New accounts get free credits to start.
 
-### 3. Set environment variables
+### 3. Set your API key
 
-```bash
-cp .env.example .env
-# Edit .env with your keys
-```
-
-Then either `source .env` or use a tool like `python-dotenv`.
-
-Or export directly:
+Paste this in your terminal before running the tool:
 
 ```bash
 export ANTHROPIC_API_KEY=your_key_here
-export APIFY_API_TOKEN=your_token_here
 ```
+
+To make it permanent so you don't have to re-paste every session:
+
+```bash
+echo 'export ANTHROPIC_API_KEY=your_key_here' >> ~/.zshrc
+source ~/.zshrc
+```
+
+(Use `.bashrc` instead of `.zshrc` if you're on bash.)
 
 ## Usage
 
@@ -84,15 +85,28 @@ python main.py --make Mazda --model "CX-5" --year-min 2017 --year-max 2021 \
 Car Deal Finder
 Searching: 2010–2014 BMW 330i
 Max price: $18,000  |  Location: Ontario
+Sources: autotrader, kijiji
 
-────────────────────────────────────────────────────
+Scraping AutoTrader CA...
+  Found 14 listings on AutoTrader CA — fetching details...
+Scraping Kijiji...
+  Found 11 listings on Kijiji
+
+Total unique listings: 23
+Scoring listings with AI (this takes ~69s)...
+
+════════════════════════════════════════════════════════════
+Top 5 deals for 2010–2014 BMW 330i
+════════════════════════════════════════════════════════════
+
+────────────────────────────────────────────────────────────
 #1 of 5  ★ STRONG BUY
 2012 BMW 330i xDrive  —  $13,500
 URL: https://www.autotrader.ca/...
 
-  Overall score : 84/100
-  Price         : 88/100
-  Mileage       : 79/100
+  Overall score :  84/100
+  Price         :  88/100
+  Mileage       :  79/100
   Listing quality: 82/100
 
   Green flags:
@@ -102,7 +116,7 @@ URL: https://www.autotrader.ca/...
     + CARFAX available on request
 
   Red flags:
-    - High mileage for age (148,000 km)
+    - Higher than average mileage for age (148,000 km)
 
   Missing info:
     ? Timing chain condition not mentioned (known issue on N52 engine)
@@ -115,19 +129,26 @@ URL: https://www.autotrader.ca/...
 
 ## Cost estimate
 
-Per search (15 listings × 2 sources = ~30 listings scored):
-- **Apify**: ~$0.15–0.30 in compute credits
-- **Anthropic API**: ~$0.03–0.05
+The only cost is the Anthropic API for scoring. Scraping is completely free.
 
-Total: roughly **$0.20–0.35 per search** using your own keys.
+Per search (~25 listings scored):
+- **Anthropic API**: ~$0.03–0.05 total
+
+Effectively free for personal use.
 
 ## Project structure
 
 ```
 car_scorer/
-├── main.py          # CLI entry point
-├── scraper.py       # Apify scraper integrations
+├── main.py          # CLI entry point and result display
+├── scraper.py       # Direct scrapers for AutoTrader CA and Kijiji
 ├── scorer.py        # Claude AI scoring engine
 ├── requirements.txt
 └── .env.example
 ```
+
+## Notes
+
+- Scraping is done respectfully with 2–4 second delays between requests and rotating user agents
+- Results may vary depending on how AutoTrader and Kijiji structure their pages — both sites update their HTML periodically
+- Built for personal/educational use
