@@ -1,128 +1,137 @@
 import time
 import random
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urlencode
 from typing import Optional, List
-
-# Rotating user agents — mimics real browsers so we don't get blocked immediately
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-]
-
-
-def _get_headers() -> dict:
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-CA,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeout
 
 
 def _polite_delay():
     time.sleep(random.uniform(2, 4))
 
 
-def _fetch(url: str) -> Optional[BeautifulSoup]:
+def _get_soup(page: Page, url: str, wait_selector: str = None) -> Optional[BeautifulSoup]:
     try:
-        resp = requests.get(url, headers=_get_headers(), timeout=15)
-        if resp.status_code == 200:
-            return BeautifulSoup(resp.text, "html.parser")
-        elif resp.status_code == 403:
-            print(f"  Blocked (403) on {url[:60]}... — try again later")
-        elif resp.status_code == 429:
-            print(f"  Rate limited (429) — waiting 30s...")
-            time.sleep(30)
-        else:
-            print(f"  HTTP {resp.status_code} on {url[:60]}...")
-    except requests.RequestException as e:
-        print(f"  Request failed: {e}")
-    return None
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+
+        if wait_selector:
+            try:
+                page.wait_for_selector(wait_selector, timeout=10000)
+            except PlaywrightTimeout:
+                pass  # Parse whatever loaded
+
+        # Extra wait for JS to render
+        page.wait_for_timeout(2000)
+        return BeautifulSoup(page.content(), "html.parser")
+
+    except Exception as e:
+        print(f"  Failed to load {url[:60]}: {e}")
+        return None
 
 def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
                        price_max: int, location: str, max_results: int = 20) -> List[dict]:
 
     params = {
-        "make": make,
-        "model": model,
-        "yearMin": year_min,
-        "yearMax": year_max,
+        "make":     make,
+        "model":    model,
+        "yearMin":  year_min,
+        "yearMax":  year_max,
         "priceMax": price_max,
-        "loc": location,
-        "hprc": "True",
-        "wcp": "True",
-        "sts": "Used",
-        "rcp": min(max_results, 15),
-        "rcs": 0,
-        "srt": 35,
+        "loc":      location,
+        "hprc":     "True",
+        "wcp":      "True",
+        "sts":      "Used",
+        "rcp":      min(max_results, 15),
+        "rcs":      0,
+        "srt":      35,
     }
 
-    url = f"https://www.autotrader.ca/cars/?{urlencode(params)}"
-    print(f"  Fetching: {url[:80]}...")
-
-    soup = _fetch(url)
-    if not soup:
-        return []
+    search_url = f"https://www.autotrader.ca/cars/?{urlencode(params)}"
+    print(f"  Fetching: {search_url[:80]}...")
 
     listings = []
-    cards = soup.select("div[class*='result-item']") or soup.select("div[data-listing-id]")
 
-    if not cards:
-        # Fallback: try embedded JSON state
-        import json, re
-        for script in soup.find_all("script", string=re.compile(r'"price"')):
-            try:
-                match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.+?});', script.string or "")
-                if match:
-                    data = json.loads(match.group(1))
-                    raw_listings = (data.get("searchResults", {})
-                                       .get("listingsContainer", {})
-                                       .get("listings", []))
-                    for item in raw_listings[:max_results]:
-                        listing = _normalize_autotrader_json(item)
-                        if listing:
-                            listings.append(listing)
-                    break
-            except Exception:
-                continue
-    else:
-        for card in cards[:max_results]:
-            listing = _parse_autotrader_card(card)
-            if listing:
-                listings.append(listing)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="en-CA",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = context.new_page()
 
-    if listings:
-        print(f"  Found {len(listings)} listings on AutoTrader CA — fetching details...")
-        for i, listing in enumerate(listings[:max_results]):
-            if listing.get("url") and listing.get("url") != "N/A":
+        # Block images/fonts to speed up loading
+        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
+
+        soup = _get_soup(page, search_url, wait_selector="[class*='result-item'], [data-listing-id]")
+
+        if not soup:
+            browser.close()
+            return []
+
+        # Try standard card selectors
+        cards = (soup.select("div[data-listing-id]") or
+                 soup.select("div[class*='result-item']") or
+                 soup.select("div[class*='listing-card']"))
+
+        if cards:
+            print(f"  Found {len(cards)} listing cards")
+            for card in cards[:max_results]:
+                listing = _parse_autotrader_card(card)
+                if listing:
+                    listings.append(listing)
+        else:
+            # Fallback: scrape listing URLs from links and visit each one
+            print("  No cards found via selectors — trying link extraction...")
+            links = soup.select("a[href*='/a/used/']") or soup.select("a[href*='autotrader.ca/a/']")
+            urls  = list(dict.fromkeys(  # deduplicate while preserving order
+                "https://www.autotrader.ca" + a["href"] if a["href"].startswith("/") else a["href"]
+                for a in links if a.get("href")
+            ))[:max_results]
+            print(f"  Found {len(urls)} listing links")
+
+            for url in urls:
                 _polite_delay()
-                detail = _fetch_autotrader_detail(listing["url"])
-                if detail:
-                    listing["description"] = detail
-            if i % 5 == 0 and i > 0:
-                print(f"    {i}/{len(listings)} details fetched...")
+                detail_soup = _get_soup(page, url)
+                if detail_soup:
+                    listing = _parse_autotrader_detail_page(detail_soup, url)
+                    if listing:
+                        listings.append(listing)
+
+        # Fetch detail pages for full descriptions if we got cards
+        if listings and cards:
+            print(f"  Fetching details for {len(listings)} listings...")
+            for i, listing in enumerate(listings):
+                if listing.get("url") and listing["url"] != "N/A":
+                    _polite_delay()
+                    detail_soup = _get_soup(page, listing["url"])
+                    if detail_soup:
+                        desc = _extract_autotrader_description(detail_soup)
+                        if desc:
+                            listing["description"] = desc
+                if i % 5 == 0 and i > 0:
+                    print(f"    {i}/{len(listings)} details fetched...")
+
+        browser.close()
 
     return listings
 
 
 def _parse_autotrader_card(card) -> Optional[dict]:
     try:
-        title_el = card.select_one("span.title-with-trim") or card.select_one("[class*='title']")
-        price_el = card.select_one("span.price-amount") or card.select_one("[class*='price']")
+        title_el = (card.select_one("span.title-with-trim") or
+                    card.select_one("[class*='title']"))
+        price_el = (card.select_one("span.price-amount") or
+                    card.select_one("[class*='price']"))
         link_el  = card.select_one("a[href*='/a/']") or card.select_one("a")
-        km_el    = card.select_one("span[class*='kms']") or card.select_one("[class*='mileage']")
+        km_el    = (card.select_one("[class*='kms']") or
+                    card.select_one("[class*='mileage']") or
+                    card.select_one("[class*='odometer']"))
 
         title = title_el.get_text(strip=True) if title_el else None
         price = price_el.get_text(strip=True) if price_el else "N/A"
-        url   = "https://www.autotrader.ca" + link_el["href"] if link_el and link_el.get("href") else "N/A"
+        href  = link_el.get("href", "") if link_el else ""
+        url   = ("https://www.autotrader.ca" + href) if href.startswith("/") else href or "N/A"
         km    = km_el.get_text(strip=True) if km_el else "N/A"
 
         if not title:
@@ -140,36 +149,33 @@ def _parse_autotrader_card(card) -> Optional[dict]:
         return None
 
 
-def _normalize_autotrader_json(item: dict) -> Optional[dict]:
+def _parse_autotrader_detail_page(soup: BeautifulSoup, url: str) -> Optional[dict]:
     try:
-        year  = item.get("year", "")
-        make  = item.get("make", "")
-        model = item.get("model", "")
-        trim  = item.get("trim", "")
-        price = item.get("price", {})
-        km    = item.get("mileage", "N/A")
-        url   = item.get("link", "N/A")
+        title_el = (soup.select_one("h1[class*='title']") or
+                    soup.select_one("h1"))
+        price_el = (soup.select_one("[class*='price-amount']") or
+                    soup.select_one("[class*='listing-price']"))
+        km_el    = (soup.select_one("[class*='kms']") or
+                    soup.select_one("[class*='mileage']"))
 
-        price_str = f"${price.get('value', 'N/A'):,}" if isinstance(price, dict) else str(price)
-        title = f"{year} {make} {model} {trim}".strip()
+        title = title_el.get_text(strip=True) if title_el else "Unknown listing"
+        price = price_el.get_text(strip=True) if price_el else "N/A"
+        km    = km_el.get_text(strip=True) if km_el else "N/A"
+        desc  = _extract_autotrader_description(soup) or f"Mileage: {km}"
 
         return {
             "source":      "AutoTrader CA",
             "title":       title,
-            "price":       price_str,
-            "mileage":     str(km),
-            "url":         f"https://www.autotrader.ca{url}" if url.startswith("/") else url,
-            "description": f"Mileage: {km} km",
+            "price":       price,
+            "mileage":     km,
+            "url":         url,
+            "description": desc,
         }
     except Exception:
         return None
 
 
-def _fetch_autotrader_detail(url: str) -> Optional[str]:
-    soup = _fetch(url)
-    if not soup:
-        return None
-
+def _extract_autotrader_description(soup: BeautifulSoup) -> Optional[str]:
     desc_el = (soup.select_one("div.vdp-description") or
                soup.select_one("[class*='description']") or
                soup.select_one("section[class*='details']"))
@@ -206,59 +212,83 @@ def scrape_kijiji(make: str, model: str, year_min: int, year_max: int,
                    price_max: int, location: str, max_results: int = 20) -> List[dict]:
 
     loc_code = KIJIJI_LOCATION_CODES.get(location.lower(), "l1700272")
-    query = f"{make} {model}".strip()
-
-    params = {
+    query    = f"{make} {model}".strip().lower().replace(" ", "-")
+    params   = {
         "price": f"__0__{price_max}",
         "year":  f"{year_min}__{year_max}",
     }
 
-    url = (f"https://www.kijiji.ca/b-cars-trucks/{loc_code}/"
-           f"{query.lower().replace(' ', '-')}/k0c174?{urlencode(params)}")
+    search_url = (f"https://www.kijiji.ca/b-cars-trucks/{loc_code}/"
+                  f"{query}/k0c174?{urlencode(params)}")
 
-    print(f"  Fetching: {url[:80]}...")
-
-    soup = _fetch(url)
-    if not soup:
-        return []
-
-    cards = soup.select("li[data-listing-id]") or soup.select("div[class*='regular-ad']")
-    print(f"  Found {len(cards)} cards on Kijiji")
+    print(f"  Fetching: {search_url[:80]}...")
 
     listings = []
-    for card in cards[:max_results]:
-        listing = _parse_kijiji_card(card)
-        if listing:
-            listings.append(listing)
 
-    if listings:
-        print(f"  Fetching details for {len(listings)} Kijiji listings...")
-        for i, listing in enumerate(listings):
-            if listing.get("url") and listing["url"] != "N/A":
-                _polite_delay()
-                detail = _fetch_kijiji_detail(listing["url"])
-                if detail:
-                    listing["description"] = detail
-            if i % 5 == 0 and i > 0:
-                print(f"    {i}/{len(listings)} details fetched...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            locale="en-CA",
+            viewport={"width": 1280, "height": 800},
+        )
+        page = context.new_page()
+        page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf}", lambda r: r.abort())
+
+        soup = _get_soup(page, search_url, wait_selector="[data-listing-id], article")
+
+        if not soup:
+            browser.close()
+            return []
+
+        cards = (soup.select("li[data-listing-id]") or
+                 soup.select("article[class*='listing']") or
+                 soup.select("div[class*='regular-ad']") or
+                 soup.select("[data-testid='listing-card']"))
+
+        print(f"  Found {len(cards)} cards on Kijiji")
+
+        for card in cards[:max_results]:
+            listing = _parse_kijiji_card(card)
+            if listing:
+                listings.append(listing)
+
+        # Fetch detail pages
+        if listings:
+            print(f"  Fetching details for {len(listings)} Kijiji listings...")
+            for i, listing in enumerate(listings):
+                if listing.get("url") and listing["url"] != "N/A":
+                    _polite_delay()
+                    detail_soup = _get_soup(page, listing["url"])
+                    if detail_soup:
+                        desc = _extract_kijiji_description(detail_soup)
+                        if desc:
+                            listing["description"] = desc
+                if i % 5 == 0 and i > 0:
+                    print(f"    {i}/{len(listings)} details fetched...")
+
+        browser.close()
 
     return listings
 
 
 def _parse_kijiji_card(card) -> Optional[dict]:
     try:
-        title_el = card.select_one("[class*='title']") or card.select_one("a[class*='title']")
+        title_el = (card.select_one("[class*='title']") or
+                    card.select_one("h3") or
+                    card.select_one("a"))
         price_el = card.select_one("[class*='price']")
         link_el  = card.select_one("a[href*='/v-']") or card.select_one("a")
-        km_el    = card.select_one("[class*='mileage']") or card.select_one("[class*='km']")
+        km_el    = (card.select_one("[class*='mileage']") or
+                    card.select_one("[class*='km']"))
 
         title = title_el.get_text(strip=True) if title_el else None
         price = price_el.get_text(strip=True) if price_el else "N/A"
-        href  = link_el["href"] if link_el and link_el.get("href") else None
-        url   = f"https://www.kijiji.ca{href}" if href and href.startswith("/") else (href or "N/A")
+        href  = link_el.get("href", "") if link_el else ""
+        url   = f"https://www.kijiji.ca{href}" if href.startswith("/") else href or "N/A"
         km    = km_el.get_text(strip=True) if km_el else "N/A"
 
-        if not title:
+        if not title or len(title) < 3:
             return None
 
         return {
@@ -273,13 +303,10 @@ def _parse_kijiji_card(card) -> Optional[dict]:
         return None
 
 
-def _fetch_kijiji_detail(url: str) -> Optional[str]:
-    soup = _fetch(url)
-    if not soup:
-        return None
-
-    desc_el = (soup.select_one("div[class*='description']") or
+def _extract_kijiji_description(soup: BeautifulSoup) -> Optional[str]:
+    desc_el = (soup.select_one("[class*='description']") or
                soup.select_one("[itemprop='description']") or
+               soup.select_one("[data-testid='vip-description']") or
                soup.select_one("div[class*='Details']"))
 
     if desc_el:
@@ -288,7 +315,7 @@ def _fetch_kijiji_detail(url: str) -> Optional[str]:
     return None
 
 def deduplicate(listings: List[dict]) -> List[dict]:
-    seen = set()
+    seen   = set()
     unique = []
     for listing in listings:
         key = (listing["title"][:40].lower().strip(), listing["price"])
