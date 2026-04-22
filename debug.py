@@ -32,5 +32,4 @@ if __name__ == "__main__":
         "kijiji_debug.html"
     )
 
-    print("\nDone. Open autotrader_debug.html and kijiji_debug.html in your browser")
-    print("and use Ctrl+F to search for a listing title to find the right HTML structure.")
+    print("\nDone")
