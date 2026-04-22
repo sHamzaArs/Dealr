@@ -3,6 +3,7 @@ import random
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlencode
+from typing import Optional
 
 # Rotating user agents — mimics real browsers so we don't get blocked immediately
 USER_AGENTS = [
@@ -30,7 +31,7 @@ def _polite_delay():
     time.sleep(random.uniform(2, 4))
 
 
-def _fetch(url: str) -> BeautifulSoup | None:
+def _fetch(url: str) -> Optional[BeautifulSoup]:
     try:
         resp = requests.get(url, headers=_get_headers(), timeout=15)
         if resp.status_code == 200:
@@ -45,11 +46,6 @@ def _fetch(url: str) -> BeautifulSoup | None:
     except requests.RequestException as e:
         print(f"  Request failed: {e}")
     return None
-
-
-# ─────────────────────────────────────────────
-# AutoTrader CA
-# ─────────────────────────────────────────────
 
 def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
                        price_max: int, location: str, max_results: int = 20) -> list[dict]:
@@ -117,7 +113,7 @@ def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
     return listings
 
 
-def _parse_autotrader_card(card) -> dict | None:
+def _parse_autotrader_card(card) -> Optional[dict]:
     try:
         title_el = card.select_one("span.title-with-trim") or card.select_one("[class*='title']")
         price_el = card.select_one("span.price-amount") or card.select_one("[class*='price']")
@@ -144,7 +140,7 @@ def _parse_autotrader_card(card) -> dict | None:
         return None
 
 
-def _normalize_autotrader_json(item: dict) -> dict | None:
+def _normalize_autotrader_json(item: dict) -> Optional[dict]:
     try:
         year  = item.get("year", "")
         make  = item.get("make", "")
@@ -169,7 +165,7 @@ def _normalize_autotrader_json(item: dict) -> dict | None:
         return None
 
 
-def _fetch_autotrader_detail(url: str) -> str | None:
+def _fetch_autotrader_detail(url: str) -> Optional[str]:
     soup = _fetch(url)
     if not soup:
         return None
@@ -249,7 +245,7 @@ def scrape_kijiji(make: str, model: str, year_min: int, year_max: int,
     return listings
 
 
-def _parse_kijiji_card(card) -> dict | None:
+def _parse_kijiji_card(card) -> Optional[dict]:
     try:
         title_el = card.select_one("[class*='title']") or card.select_one("a[class*='title']")
         price_el = card.select_one("[class*='price']")
@@ -277,7 +273,7 @@ def _parse_kijiji_card(card) -> dict | None:
         return None
 
 
-def _fetch_kijiji_detail(url: str) -> str | None:
+def _fetch_kijiji_detail(url: str) -> Optional[str]:
     soup = _fetch(url)
     if not soup:
         return None
@@ -290,11 +286,6 @@ def _fetch_kijiji_detail(url: str) -> str | None:
         return desc_el.get_text(separator=" ", strip=True)[:2000]
 
     return None
-
-
-# ─────────────────────────────────────────────
-# Shared utilities
-# ─────────────────────────────────────────────
 
 def deduplicate(listings: list[dict]) -> list[dict]:
     seen = set()
