@@ -93,7 +93,8 @@ def scrape_autotrader(make: str, model: str, year_min: int, year_max: int,
     if model:
         params["mdl"] = model
 
-    url = f"https://www.autotrader.ca/cars/{make_slug}/{region}/ot_used?{urlencode(params)}"
+    model_slug = model.lower().replace(" ", "-").replace("_", "-")
+    url = f"https://www.autotrader.ca/cars/{make_slug}/{model_slug}/{region}/ot_used?{urlencode(params)}"
     print(f"  URL: {url}")
 
     html = _fetch(url)
