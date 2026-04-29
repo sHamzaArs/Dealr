@@ -126,29 +126,3 @@ URL: https://www.autotrader.ca/...
   only concern — worth getting a pre-purchase inspection focused on the cooling
   system and timing chain.
 ```
-
-## Cost estimate
-
-The only cost is the Anthropic API for scoring. Scraping is completely free.
-
-Per search (~25 listings scored):
-- **Anthropic API**: ~$0.03–0.05 total
-
-Effectively free for personal use.
-
-## Project structure
-
-```
-car_scorer/
-├── main.py          # CLI entry point and result display
-├── scraper.py       # Direct scrapers for AutoTrader CA and Kijiji
-├── scorer.py        # Claude AI scoring engine
-├── requirements.txt
-└── .env.example
-```
-
-## Notes
-
-- Scraping is done respectfully with 2–4 second delays between requests and rotating user agents
-- Results may vary depending on how AutoTrader and Kijiji structure their pages — both sites update their HTML periodically
-- Built for personal/educational use
